@@ -200,14 +200,21 @@ def schedule_of(book, ch, chapters) -> dt.datetime:
 
 
 # ---------- 浏览器 ----------
-def open_browser(pw):
+def open_browser(pw, visible=False):
+    """visible=False 且 config.HIDE_BROWSER 时把窗口放到屏幕外，后台运行。
+    不用 headless：headless 的 UA 带 HeadlessChrome，容易被识别成自动化。"""
+    args = ["--disable-blink-features=AutomationControlled"]
+    if getattr(config, "HIDE_BROWSER", False) and not visible:
+        # 窗口在屏幕外时 Windows 会判定为被遮挡，Chrome 会暂停渲染，要关掉这个检测
+        args += ["--window-position=-32000,-32000",
+                 "--disable-features=CalculateNativeWinOcclusion"]
     opts = dict(
         user_data_dir=str(BASE_DIR / config.PROFILE_DIR),
         headless=False,
         viewport={"width": 1400, "height": 900},
         locale="zh-CN",
         # 降低自动化特征：去掉 navigator.webdriver 标记和「受自动测试软件控制」提示条
-        args=["--disable-blink-features=AutomationControlled"],
+        args=args,
         ignore_default_args=["--enable-automation"],
     )
     try:
@@ -285,7 +292,7 @@ def visible_dialogs(page) -> list:
 
 def login():
     with sync_playwright() as pw:
-        ctx, page = open_browser(pw)
+        ctx, page = open_browser(pw, visible=True)
         page.goto(config.URLS["home"])
         print("请在打开的浏览器里扫码登录番茄作家后台。")
         print("登录成功、能看到作品列表后，直接关掉浏览器窗口即可。")
@@ -300,7 +307,7 @@ def login():
 def inspect(book_id):
     """打开新建章节页并启动 Playwright Inspector，用来重新取选择器。"""
     with sync_playwright() as pw:
-        ctx, page = open_browser(pw)
+        ctx, page = open_browser(pw, visible=True)
         page.goto(config.URLS["new_chapter"].format(book_id=book_id))
         page.pause()
         ctx.close()

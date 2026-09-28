@@ -81,6 +81,10 @@ REST_SECONDS = 60
 # 浏览器用户数据目录（保存登录状态，别删）
 PROFILE_DIR = "browser_profile"
 
+# 上传/核对等操作时浏览器在后台运行（窗口放到屏幕外，任务栏仍有图标）
+# 想看它在做什么就改成 False。扫码登录和 inspect 始终显示窗口
+HIDE_BROWSER = True
+
 # ========== 4. 页面元素（番茄改版后如果失效，在这里改） ==========
 # 可以运行 `python main.py inspect` 打开 Playwright Inspector 重新取选择器
 URLS = {
