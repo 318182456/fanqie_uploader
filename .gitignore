@@ -1,0 +1,8 @@
+# 登录状态（含 cookie，绝对不能上传）
+browser_profile/
+# 每本书的进度、截图、预览、报告
+books/
+logs/
+__pycache__/
+*.pyc
+.stop
