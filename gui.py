@@ -36,6 +36,7 @@ class App(tk.Tk):
         self.proc = None            # 正在跑的 main.py 子进程
         self.out_q = queue.Queue()  # 子进程输出 → 界面
         self.chapters = []
+        self.changed_idx, self.unknown_idx = set(), set()
         self.book = None
 
         self._build()
@@ -76,7 +77,9 @@ class App(tk.Tk):
             b.pack(side="left", padx=(0, 4))
             self.run_buttons.append(b)
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=6)
-        for text, fn in [("更新选中章正文", self.update_selected),
+        for text, fn in [("对比旧版 txt", self.compare_old),
+                         ("更新全部改动章", self.update_changed),
+                         ("更新选中章正文", self.update_selected),
                          ("单章定时发布", lambda: self.one_chapter("publish-one")),
                          ("改发布时间", lambda: self.one_chapter("reschedule"))]:
             b = ttk.Button(bar, text=text, command=fn)
@@ -106,7 +109,7 @@ class App(tk.Tk):
         fbar.pack(fill="x", pady=(0, 4))
         ttk.Label(fbar, text="筛选：").pack(side="left")
         self.filter_var = tk.StringVar(value="全部")
-        for f in ("全部", "本次待发", "已处理", "有问题"):
+        for f in ("全部", "本次待发", "已处理", "有改动", "有问题"):
             ttk.Radiobutton(fbar, text=f, value=f, variable=self.filter_var,
                             command=self.fill_table).pack(side="left")
         ttk.Label(fbar, text="  搜索：").pack(side="left")
@@ -126,6 +129,7 @@ class App(tk.Tk):
         self.tree.tag_configure("todo", foreground="#0a5")
         self.tree.tag_configure("warn", background="#fff3cd")
         self.tree.tag_configure("bad", background="#f8d7da")
+        self.tree.tag_configure("chg", foreground="#06c")
         sb = ttk.Scrollbar(tf, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -172,6 +176,9 @@ class App(tk.Tk):
             return
 
         self.chapters = splitter.split_chapters(path)
+        changed, unknown = uploader.changed_chapters(self.book, self.chapters)
+        self.changed_idx = {c.index for c in changed}
+        self.unknown_idx = {c.index for c in unknown}
         todo, done = uploader.pending(self.book, self.chapters)
         self.todo_idx = {c.index for c in todo}
         self.done_idx = done
@@ -209,6 +216,9 @@ class App(tk.Tk):
                      f"排期只用 {pday}/{pmonth}")
             if todo:
                 info += f"   本次排期：{self.when[todo[0].index][:10]} ~ {self.when[todo[-1].index][:10]}"
+        info += f"\n番茄上的章节：正文有改动 {len(changed)} 章"
+        if unknown:
+            info += f"，另有 {len(unknown)} 章没记录番茄版本（点「对比旧版 txt」选精修前的 txt 补上）"
         self.info_var.set(info)
         self.fill_table()
 
@@ -217,7 +227,9 @@ class App(tk.Tk):
         f, kw = self.filter_var.get(), self.search_var.get().strip()
         for c in self.chapters:
             done, todo, note = c.index in self.done_idx, c.index in self.todo_idx, self.notes.get(c.index, "")
-            if f == "本次待发" and not todo or f == "已处理" and not done or f == "有问题" and not note:
+            chg = c.index in self.changed_idx
+            if (f == "本次待发" and not todo or f == "已处理" and not done
+                    or f == "有改动" and not chg or f == "有问题" and not note):
                 continue
             if kw and kw not in c.full_title and kw != str(c.number):
                 continue
@@ -225,9 +237,12 @@ class App(tk.Tk):
             tags = ["done" if done else "todo" if todo else ""]
             if note:
                 tags.append("bad" if "上限" in note or "空" in note else "warn")
+            if chg:
+                tags.append("chg")
+            extra = "正文有改动" if chg else "未记录番茄版本" if c.index in self.unknown_idx else ""
             self.tree.insert("", "end", iid=str(c.index), tags=tags, values=(
                 c.index, c.number, c.title, c.char_count, c.volume, status,
-                self.when.get(c.index, ""), note))
+                self.when.get(c.index, ""), "；".join(x for x in (extra, note) if x)))
 
     def selected_chapters(self):
         sel = {int(i) for i in self.tree.selection()}
@@ -348,15 +363,51 @@ class App(tk.Tk):
                           "之后要用「全书核对」确认是否重复/漏发。\n\n确定强制终止吗？"):
             self.proc.kill()
 
+    # ---------- 精修后更新正文 ----------
+    def compare_old(self):
+        """选精修前的旧 txt，记下番茄上现在是哪个版本，之后就能自动找出改过的章。"""
+        if not self.chapters or self.proc:
+            return
+        path = filedialog.askopenfilename(title="选择精修前（和番茄上一致）的旧 txt",
+                                          filetypes=[("文本", "*.txt"), ("全部", "*.*")])
+        if not path:
+            return
+        if Path(path).resolve() == Path(self.book["txt"]).resolve():
+            messagebox.showerror("选错了", "这是 config.py 里配置的新版 txt，请选精修前的旧版")
+            return
+        try:
+            n = uploader.seed_baseline(self.book, self.chapters, path)
+        except SystemExit as e:
+            messagebox.showerror("对不上", str(e))
+            return
+        self.log_line(f"已用旧 txt 补记 {n} 章的番茄版本：{path}\n", "ok")
+        self.refresh()
+        self.filter_var.set("有改动")
+        self.fill_table()
+        self.log_line(f"正文有改动 {len(self.changed_idx)} 章："
+                      f"{uploader.fmt_numbers([c for c in self.chapters if c.index in self.changed_idx]) or '无'}\n")
+
+    def update_changed(self):
+        chs = [c for c in self.chapters if c.index in self.changed_idx]
+        if not chs:
+            tip = "（有章节没记录番茄版本，先点「对比旧版 txt」）" if self.unknown_idx else ""
+            messagebox.showinfo("提示", f"番茄上没有需要更新的章节{tip}")
+            return
+        words = sum(c.char_count for c in chs)
+        if messagebox.askyesno("更新全部改动章", f"共 {len(chs)} 章、{words} 字：\n第 {uploader.fmt_numbers(chs)} 章\n\n"
+                               "修改已发布章节也占每日/每月字数额度，额度用完会自动停下，\n"
+                               "之后再点这个按钮会接着更新（已更新的自动跳过）。确定开始吗？"):
+            self.run(["update-changed"])
+
     # ---------- 针对选中章节的操作 ----------
     def update_selected(self):
         chs = self.selected_chapters()
         if not chs:
             messagebox.showinfo("提示", "先在列表里选中要更新的章节（可多选）")
             return
-        nums = [str(c.number) for c in chs]
-        if messagebox.askyesno("更新正文", f"用 txt 里的新版正文替换番茄上的这些章节：\n第 {', '.join(nums)} 章\n\n确定吗？"):
-            self.run(["update", *nums])
+        if messagebox.askyesno("更新正文", f"用 txt 里的新版正文替换番茄上的这些章节：\n第 {uploader.fmt_numbers(chs)} 章\n\n"
+                               "番茄上已经是新版的会自动跳过。确定吗？"):
+            self.run(["update", *[str(c.number) for c in chs]])
 
     def one_chapter(self, cmd):
         chs = self.selected_chapters()

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """用 Playwright 操作番茄作家后台：存草稿，或直接定时发布到章节管理。"""
 import datetime as dt
+import hashlib
 import json
 import random
 import re
@@ -12,7 +13,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 import config
-from splitter import cn_to_int
+from splitter import cn_to_int, split_chapters
 
 BASE_DIR = Path(__file__).parent
 BOOKS_DIR = BASE_DIR / "books"
@@ -93,13 +94,84 @@ def load_progress(book_id) -> set:
     return set(_load(book_id)["done"])
 
 
+def _save(book_id, data):
+    _progress_file(book_id).write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def save_progress(book_id, index, when=None):
     data = _load(book_id)
     data["done"] = sorted(set(data["done"]) | {index})
     if when:
         data.setdefault("schedule", {})[str(index)] = when
-    _progress_file(book_id).write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    _save(book_id, data)
+
+
+# ---------- 正文指纹：记下番茄上每章是哪个版本（按章节号），用来找改动章、更新时跳过已更新的 ----------
+def content_hash(ch) -> str:
+    return hashlib.md5("\n".join([ch.title, *ch.paragraphs]).encode("utf-8")).hexdigest()[:12]
+
+
+def save_hash(book_id, ch):
+    data = _load(book_id)
+    data.setdefault("content", {})[str(ch.number)] = content_hash(ch)
+    _save(book_id, data)
+
+
+def on_fanqie(book, chapters) -> list:
+    """已经传到番茄上的章节：进度里记过的，加上 start 之前的（可能是手动发的）。"""
+    done = load_progress(book["book_id"])
+    start = book.get("start") or 1
+    return [c for c in chapters if c.index in done or c.index < start]
+
+
+def seed_baseline(book, chapters, old_txt) -> int:
+    """用精修前的旧 txt 补记番茄上现有版本的指纹。已有记录的章以记录为准，不覆盖。
+    返回补记了多少章。"""
+    use_book(book)
+    old = {c.index: c for c in split_chapters(old_txt)}
+    moved = [(c, old[c.index]) for c in on_fanqie(book, chapters)
+             if c.index in old and old[c.index].number != c.number]
+    if moved:
+        c, o = moved[0]
+        raise SystemExit(f"新旧 txt 的章节顺序对不上：新版第 {c.index} 个是「{c.full_title}」，"
+                         f"旧版是「{o.full_title}」。精修时增删/拆分过章节的话没法按顺序对应，请先确认")
+    data = _load(book["book_id"])
+    rec = data.setdefault("content", {})
+    n = 0
+    for c in on_fanqie(book, chapters):
+        if c.index in old and str(c.number) not in rec:
+            rec[str(c.number)] = content_hash(old[c.index])
+            n += 1
+    _save(book["book_id"], data)
+    return n
+
+
+def changed_chapters(book, chapters):
+    """返回 (正文有改动的章, 没有版本记录、无法判断的章)，只看已传到番茄上的章。"""
+    use_book(book)
+    rec = _load(book["book_id"]).get("content", {})
+    changed, unknown = [], []
+    for c in on_fanqie(book, chapters):
+        h = rec.get(str(c.number))
+        if h is None:
+            unknown.append(c)
+        elif h != content_hash(c):
+            changed.append(c)
+    return changed, unknown
+
+
+def fmt_numbers(chs) -> str:
+    """章节号压缩成区间：1,2,3,5,7,8 -> 「1-3、5、7-8」"""
+    nums = sorted(c.number for c in chs)
+    parts, i = [], 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        parts.append(str(nums[i]) if i == j else f"{nums[i]}-{nums[j]}")
+        i = j + 1
+    return "、".join(parts)
 
 
 def write_back_config(book, ch, when=None):
@@ -630,14 +702,25 @@ def fill_modal(page, m, ch, when):
     set_picker(page, m.locator("input[placeholder='请选择时间']").first, when.strftime("%H:%M"))
 
 
-def confirm_publish(page, ch, m):
+def toasts(page) -> list:
+    """页面顶部当前显示的所有提示条文字（成功/警告/普通/错误）。"""
+    try:
+        return [t.strip() for t in page.locator(".arco-message, .byte-message").all_inner_texts() if t.strip()]
+    except Exception:
+        return []
+
+
+def confirm_publish(page, ch, m) -> list:
+    """点「确认发布」并处理后续弹窗，返回期间出现过的提示条文字。"""
     m.locator("button:has-text('确认发布')").first.click()
 
     # 确认后也可能再弹错别字提示等；处理完再等几秒让提交请求发出去
     deadline = time.time() + 30
     quiet = 0
+    seen = []
     while time.time() < deadline:
         time.sleep(1)
+        seen += [t for t in toasts(page) if t not in seen]
         err = page.locator(".arco-message-error, .byte-message-error").first
         if err.count() and err.is_visible():
             text = err.inner_text().strip()
@@ -649,7 +732,7 @@ def confirm_publish(page, ch, m):
             continue
         quiet = quiet + 1 if not m.is_visible() else 0
         if quiet >= 3:
-            return
+            return seen
     raise RuntimeError(f"点「确认发布」后 30 秒仍有弹窗未处理：{visible_dialogs(page)}")
 
 
@@ -730,7 +813,12 @@ def manage_url(book):
 def find_chapter_row(page, book, ch):
     """章节管理里切到这一章的卷，返回 (编辑链接, 当前发布时间)。"""
     page.goto(manage_url(book), wait_until="domcontentloaded")
-    page.locator("tr.arco-table-tr").first.wait_for(timeout=20000)
+    try:
+        page.locator("tr.arco-table-tr").first.wait_for(timeout=20000)
+    except Exception:
+        if "login" in page.url or "passport" in page.url:
+            raise RuntimeError("登录已失效，请先运行 python main.py login")
+        raise
     time.sleep(1.5)
     # 默认显示最新一卷；这一章不在当前列表里才切分卷
     if ch.volume and not page.locator("tr.arco-table-tr", has_text=f"第{ch.number}章 ").count():
@@ -790,8 +878,7 @@ def reschedule(book, ch, when: dt.datetime):
                 raise RuntimeError(f"提交后章节管理里的时间是 {now}，不是 {when:%Y-%m-%d %H:%M}")
             data = _load(book["book_id"])
             data.setdefault("schedule", {})[str(ch.index)] = f"{when:%Y-%m-%d %H:%M}"
-            _progress_file(book["book_id"]).write_text(
-                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            _save(book["book_id"], data)
             print(f"  ✓ 已改好，章节管理里显示 {now}")
         except Exception:
             shot = book_dir(sub="screenshots") / f"改时间_第{ch.number}章.png"
@@ -816,6 +903,7 @@ def publish_one(book, ch, when: dt.datetime):
             print(f"  第{ch.number}章 {ch.title}（{ch.char_count}字） → {when:%Y-%m-%d %H:%M}")
             when = publish(page, book["book_id"], ch, when)
             save_progress(book["book_id"], ch.index, when.strftime("%Y-%m-%d %H:%M"))
+            save_hash(book["book_id"], ch)
             print(f"  ✓ 完成，定时 {when:%Y-%m-%d %H:%M}")
         except Exception:
             shot = book_dir(sub="screenshots") / f"单章发布_第{ch.number}章.png"
@@ -829,83 +917,161 @@ def publish_one(book, ch, when: dt.datetime):
             ctx.close()
 
 
-def update_content(book, chapters_to_update):
+def update_content(book, chapters_to_update, force=False):
     """用 txt 里的新版正文替换已发布/已定时章节的内容（标题、序号一起核对）。
-    已定时的章节保持原发布时间不变；已发布的章节番茄会重新审核。"""
+    已定时的章节保持原发布时间不变；已发布的章节番茄会重新审核。
+    番茄上已经是新版的章节自动跳过（force=True 时照样重传），中断后重跑同一命令即可接着更新。
+    某章出错会记下来、继续下一章，最后汇总。"""
     use_book(book)
+    book_id = book["book_id"]
+    rec = _load(book_id).get("content", {})
+    todo = [c for c in chapters_to_update if force or rec.get(str(c.number)) != content_hash(c)]
+    if len(todo) < len(chapters_to_update):
+        print(f"  {len(chapters_to_update) - len(todo)} 章番茄上已经是新版，跳过（要强制重传加 --force）")
+    if not todo:
+        print("  没有需要更新的章节。")
+        return
+
+    ok, skipped, failed = [], [], []
+    fails_in_row = 0
     with sync_playwright() as pw:
         ctx, page = open_browser(pw)
         try:
-            for ch in chapters_to_update:
-                url, when = find_chapter_row(page, book, ch)
-                print(f"  第{ch.number}章 {ch.title}（新版 {ch.char_count}字，发布时间 {when}）")
-                if url is None:
-                    print("    这一章正在审核中，暂时不能编辑，跳过")
+            for n, ch in enumerate(todo, 1):
+                if STOP_FLAG.exists():
+                    print(f"  收到停止请求，已停在第{ch.number}章之前。重新运行即可接着更新。")
+                    break
+                print(f"  [{n}/{len(todo)}] 第{ch.number}章 {ch.title}（新版 {ch.char_count}字）")
+                try:
+                    reason = _update_one(page, book, ch)
+                except Exception as e:
+                    shot = book_dir(sub="screenshots") / f"更新正文_第{ch.number}章.png"
+                    try:
+                        page.screenshot(path=str(shot))
+                    except Exception:
+                        shot = "（截图失败，浏览器可能已关闭）"
+                    print(f"    ✖ 失败：{type(e).__name__}: {e}")
+                    print(f"    截图：{shot}")
+                    failed.append((ch, str(e).splitlines()[0][:80] if str(e) else type(e).__name__))
+                    fails_in_row += 1
+                    if "登录已失效" in str(e) or page.is_closed():
+                        print("  登录失效或浏览器已关闭，停止。")
+                        break
+                    if isinstance(e, DailyLimit) and fails_in_row >= 2:
+                        print("  连续提示超出字数上限，今天的修改额度应该用完了，停止。明天重新运行同一命令会接着更新。")
+                        break
+                    if fails_in_row >= 3:
+                        print("  连续 3 章失败，停止。看一下截图和日志，修好后重新运行。")
+                        break
+                    time.sleep(5)
                     continue
-                if re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", when):
-                    t = dt.datetime.strptime(when, "%Y-%m-%d %H:%M")
-                    if dt.datetime.now() < t < dt.datetime.now() + dt.timedelta(minutes=35):
-                        print("    离发布不到 30 分钟，番茄不允许修改，跳过（发布后再运行）")
-                        continue
-
-                page.goto(url, wait_until="domcontentloaded")
-                find(page, "title", timeout=20000)
-                time.sleep(2)
-                for _ in range(3):
-                    b = page.locator("button:visible:has-text('我知道了')")
-                    if b.count():
-                        b.last.click()
-                        time.sleep(0.8)
-                close_tour(page)
-                before = header_word_count(page)
-
-                # 核对/补齐序号和标题，再整体替换正文
-                no_box = find(page, "chapter_no", timeout=2000)
-                if no_box is not None and no_box.input_value() != str(ch.number):
-                    raise RuntimeError(f"编辑页序号是 {no_box.input_value()}，不是 {ch.number}，不改")
-                title_box = find(page, "title")
-                if title_box.input_value() != ch.title:
-                    title_box.fill(ch.title)
-                editor = find(page, "content")
-                fill_editor(page, editor, ch.paragraphs)
-                time.sleep(0.8)
-                got = len(editor.inner_text().replace("\n", "").replace(" ", ""))
-                if got < ch.char_count * 0.95:
-                    raise RuntimeError(f"正文没填进去（编辑器 {got} 字 / 原文 {ch.char_count} 字）")
-                wait_editor_synced(page, editor)
-                print(f"    正文已替换：{before} → {header_word_count(page)} 字")
-
-                page.locator("button.publish-button").first.click()
-                m = wait_modal(page, ch)
-                ai = m.locator("label.arco-radio", has_text="是" if P()["use_ai"] else "否").first
-                ai.click()
-                time.sleep(0.3)
-                if "arco-radio-checked" not in (ai.get_attribute("class") or ""):
-                    raise RuntimeError("「是否使用AI」没选上")
-                confirm_publish(page, ch, m)
-
-                # 回章节管理核对字数
-                page2_url, when2 = find_chapter_row(page, book, ch)
-                row = page.locator("tr.arco-table-tr", has_text=f"第{ch.number}章 ").first
-                cells = row.locator("td").all_inner_texts()
-                words, status = cells[1].strip(), cells[3].strip()
-                # 已发布章节改完会进「修改审核中」，字数要审核通过后才更新
-                ok = "审核中" in status or (
-                    words.isdigit() and abs(int(words) - ch.char_count) <= max(30, ch.char_count * 0.02))
-                print(f"    {'✓' if ok else '⚠'} 章节管理：{words} 字，{status}，发布时间 {when2}")
-                if not ok:
-                    raise RuntimeError(f"提交后章节管理里是 {words} 字，和新版 {ch.char_count} 字对不上")
-                time.sleep(random.uniform(*config.DELAY_RANGE))
-        except Exception:
-            shot = book_dir(sub="screenshots") / f"更新正文_{dt.datetime.now():%H%M%S}.png"
-            try:
-                page.screenshot(path=str(shot))
-                print(f"  截图：{shot}")
-            except Exception:
-                pass
-            raise
+                fails_in_row = 0
+                if reason:
+                    print(f"    ⚠ {reason}，跳过")
+                    skipped.append((ch, reason))
+                    continue
+                save_hash(book_id, ch)
+                ok.append(ch)
+                if len(ok) % config.REST_EVERY == 0:
+                    print(f"  休息 {config.REST_SECONDS} 秒...")
+                    time.sleep(config.REST_SECONDS)
+                else:
+                    time.sleep(random.uniform(*config.DELAY_RANGE))
         finally:
             ctx.close()
+
+    handled = {c.number for c in ok} | {c.number for c, _ in skipped + failed}
+    rest = [c for c in todo if c.number not in handled]
+    print("\n  ===== 更新结果 =====")
+    print(f"  ✓ 成功 {len(ok)} 章" + (f"：{fmt_numbers(ok)}" if ok else ""))
+    if skipped:
+        print(f"  ⚠ 跳过 {len(skipped)} 章：")
+        for c, r in skipped:
+            print(f"      第{c.number}章：{r}")
+    if failed:
+        print(f"  ✖ 失败 {len(failed)} 章：")
+        for c, r in failed:
+            print(f"      第{c.number}章：{r}")
+    if rest:
+        print(f"  未处理 {len(rest)} 章：{fmt_numbers(rest)}")
+    if skipped or failed or rest:
+        print("  重新运行同一命令即可，已更新成功的章会自动跳过。")
+    if failed:
+        raise SystemExit(1)
+
+
+def _update_one(page, book, ch):
+    """更新一章。成功返回 None；这一章暂时不能改时返回跳过原因；出错抛异常。"""
+    url, when = find_chapter_row(page, book, ch)
+    print(f"    番茄上的发布时间：{when}")
+    if url is None:
+        return "正在审核中，暂时不能编辑"
+    if re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", when):
+        t = dt.datetime.strptime(when, "%Y-%m-%d %H:%M")
+        if dt.datetime.now() < t < dt.datetime.now() + dt.timedelta(minutes=35):
+            return "离发布不到 30 分钟，番茄不允许修改（发布后再运行）"
+
+    page.goto(url, wait_until="domcontentloaded")
+    find(page, "title", timeout=20000)
+    time.sleep(2)
+    for _ in range(3):
+        b = page.locator("button:visible:has-text('我知道了')")
+        if b.count():
+            b.last.click()
+            time.sleep(0.8)
+    close_tour(page)
+    before = header_word_count(page)
+
+    # 核对/补齐序号和标题，再整体替换正文
+    no_box = find(page, "chapter_no", timeout=2000)
+    if no_box is not None and no_box.input_value() != str(ch.number):
+        raise RuntimeError(f"编辑页序号是 {no_box.input_value()}，不是 {ch.number}，不改")
+    title_box = find(page, "title")
+    if title_box.input_value() != ch.title:
+        title_box.fill(ch.title)
+    editor = find(page, "content")
+    fill_editor(page, editor, ch.paragraphs)
+    time.sleep(0.8)
+    got = len(editor.inner_text().replace("\n", "").replace(" ", ""))
+    if got < ch.char_count * 0.95:
+        raise RuntimeError(f"正文没填进去（编辑器 {got} 字 / 原文 {ch.char_count} 字）")
+    wait_editor_synced(page, editor)
+    print(f"    正文已替换：{before} → {header_word_count(page)} 字")
+
+    page.locator("button.publish-button").first.click()
+    m = wait_modal(page, ch)
+    ai = m.locator("label.arco-radio", has_text="是" if P()["use_ai"] else "否").first
+    ai.click()
+    time.sleep(0.3)
+    if "arco-radio-checked" not in (ai.get_attribute("class") or ""):
+        raise RuntimeError("「是否使用AI」没选上")
+    seen = confirm_publish(page, ch, m)
+    if seen:
+        print(f"    番茄提示：{' / '.join(seen)}")
+
+    # 番茄明确提示「已提交，预计…完成审核」：有的定时章节列表里仍显示「待发布」和旧字数，审核通过后才更新
+    if any("已提交" in t for t in seen):
+        _, when2 = find_chapter_row(page, book, ch)
+        print(f"    ✓ 已提交审核（审核通过后章节管理的字数才会变），发布时间 {when2}")
+        return None
+
+    # 回章节管理核对字数；列表偶尔没刷新，对不上时等几秒再看一次
+    for attempt in (1, 2):
+        _, when2 = find_chapter_row(page, book, ch)
+        row = page.locator("tr.arco-table-tr", has_text=f"第{ch.number}章 ").first
+        cells = row.locator("td").all_inner_texts()
+        words, status = cells[1].strip(), cells[3].strip()
+        # 已发布/已定时章节改完会进「审核中」，字数要审核通过后才更新
+        ok = "审核中" in status or (
+            words.isdigit() and abs(int(words) - ch.char_count) <= max(30, ch.char_count * 0.02))
+        if ok or attempt == 2:
+            break
+        time.sleep(8)
+    print(f"    {'✓' if ok else '⚠'} 章节管理：{words} 字，{status}，发布时间 {when2}")
+    if not ok:
+        tip = f"（番茄提示：{' / '.join(seen)}）" if seen else "（番茄没有给出提示）"
+        raise RuntimeError(f"提交没生效：章节管理里还是 {words} 字、{status}，新版 {ch.char_count} 字{tip}")
+    return None
 
 
 # ---------- 全书核对：番茄后台 vs txt ----------
@@ -1115,6 +1281,7 @@ def upload_book(book, chapters, dry_run=False, rehearse=False):
                     print("  演练结束，没有发布任何章节。")
                     return
                 save_progress(book_id, ch.index, when and when.strftime("%Y-%m-%d %H:%M"))
+                save_hash(book_id, ch)
                 write_back_config(book, ch, when)
 
                 if n % config.REST_EVERY == 0:

@@ -8,7 +8,10 @@
     python main.py upload             上传/定时发布 config.BOOKS 里的所有书（支持断点续传）
     python main.py rehearse           发布演练：只走第一章，填好发布设置后点「取消」，不会发布
     python main.py check              全书核对：番茄后台 vs txt（漏发、重复、标题、字数、空档、草稿残留）
-    python main.py update <章节号> [章节号...]  用 txt 新版正文更新已发布/已定时的章节
+    python main.py update <章节号> [章节号...] [--force]  用 txt 新版正文更新已发布/已定时的章节
+                                      （番茄上已是新版的章自动跳过，--force 强制重传）
+    python main.py changed [旧txt]    列出正文有改动、需要更新的章节（第一次用要带上精修前的旧 txt）
+    python main.py update-changed [旧txt]  更新所有有改动的章节；中断后重跑会接着更新
     python main.py publish-one <章节号> <YYYY-MM-DD> [HH:MM]  单独定时发布一章（补漏章）
     python main.py reschedule <章节号> <YYYY-MM-DD> [HH:MM]  修改已定时发布章节的发布时间
     python main.py inspect <book_id>  打开新建章节页 + Inspector，用来修正选择器
@@ -143,6 +146,26 @@ def publish_one(number, date, hhmm=None):
     uploader.publish_one(book, ch, when)
 
 
+def find_changed(old_txt=None):
+    """找出第一本书里已传到番茄上、正文有改动的章节。给了旧 txt 就先用它补记番茄上的版本。"""
+    book = config.BOOKS[0]
+    chapters = splitter.split_chapters(book["txt"])
+    if old_txt:
+        n = uploader.seed_baseline(book, chapters, old_txt)
+        print(f"  已用旧 txt 补记 {n} 章的番茄版本：{old_txt}")
+    changed, unknown = uploader.changed_chapters(book, chapters)
+    total = len(uploader.on_fanqie(book, chapters))
+    print(f"\n《{Path(book['txt']).stem}》番茄上 {total} 章，其中正文有改动 {len(changed)} 章"
+          + (f"：{uploader.fmt_numbers(changed)}" if changed else ""))
+    if changed:
+        words = sum(c.char_count for c in changed)
+        print(f"  改动章合计 {words} 字（修改已发布章节也占每日/每月字数额度，可能要分几天跑完）")
+    if unknown:
+        print(f"  ⚠ {len(unknown)} 章没有记录番茄上的版本，无法判断是否改过：{uploader.fmt_numbers(unknown)}")
+        print("    带上精修前的旧 txt 运行一次：python main.py changed <旧txt路径>")
+    return changed
+
+
 def run(cmd):
     if cmd == "login":
         uploader.login()
@@ -158,9 +181,13 @@ def run(cmd):
             uploader.check_book(book, splitter.split_chapters(book["txt"]))
     elif cmd == "update" and len(sys.argv) > 2:
         book = config.BOOKS[0]
-        nums = [int(x) for x in sys.argv[2:]]
+        nums = [int(x) for x in sys.argv[2:] if x != "--force"]
         chs = [c for c in splitter.split_chapters(book["txt"]) if c.number in nums]
-        uploader.update_content(book, chs)
+        uploader.update_content(book, chs, force="--force" in sys.argv)
+    elif cmd in ("changed", "update-changed"):
+        changed = find_changed(sys.argv[2] if len(sys.argv) > 2 else None)
+        if cmd == "update-changed" and changed:
+            uploader.update_content(config.BOOKS[0], changed)
     elif cmd == "publish-one" and len(sys.argv) > 3:
         publish_one(int(sys.argv[2]), sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else None)
     elif cmd == "reschedule" and len(sys.argv) > 3:
